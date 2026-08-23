@@ -951,6 +951,64 @@ function strictCoexistenceEventTime(
   return date.toISOString()
 }
 
+interface CoexistenceHistoryMediaTarget {
+  id: string
+  conversation_id: string
+  created_at: string
+  content_type: string
+  content_text: string | null
+  media_url: string | null
+  history_media_pending: boolean
+}
+
+async function findCoexistenceHistoryMediaTarget(
+  accountId: string,
+  messageId: string
+): Promise<CoexistenceHistoryMediaTarget | null> {
+  const { data: rows, error } =
+    await supabaseAdmin()
+      .from('messages')
+      .select(
+        'id, conversation_id, created_at, content_type, content_text, media_url, history_media_pending, conversations!inner(account_id)'
+      )
+      .eq('message_id', messageId)
+      .eq('conversations.account_id', accountId)
+      .limit(2)
+
+  if (error) {
+    console.error(
+      '[coexistence-history] media target lookup failed:',
+      messageId,
+      error
+    )
+    return null
+  }
+
+  if (!rows || rows.length === 0) {
+    /*
+     * Important cutoff property:
+     *
+     * If the initial placeholder was below the cutoff, no local
+     * message exists. Stop here BEFORE Meta media lookup/download.
+     */
+    console.info(
+      '[coexistence-history] media detail has no accepted placeholder; ignored before media processing:',
+      messageId
+    )
+    return null
+  }
+
+  if (rows.length > 1) {
+    console.error(
+      '[coexistence-history] ambiguous media history target; ignored:',
+      messageId
+    )
+    return null
+  }
+
+  return rows[0] as CoexistenceHistoryMediaTarget
+}
+
 function mapCoexistenceHistoryStatus(
   status: string | undefined,
   isOutbound: boolean
@@ -969,6 +1027,196 @@ function mapCoexistenceHistoryStatus(
       return 'failed'
     default:
       return isOutbound ? 'sent' : 'delivered'
+  }
+}
+
+async function processCoexistenceHistoryMediaDetails(
+  value: WhatsAppWebhookValue,
+  config: {
+    account_id: string
+    access_token: string
+    mirror_inbound_media?: boolean
+  }
+) {
+  const messages = value.messages ?? []
+
+  if (messages.length === 0) return
+
+  const supportedTypes = new Set([
+    'image',
+    'video',
+    'document',
+    'audio',
+    'sticker',
+  ])
+
+  /*
+   * Decrypt lazily. A detail for a below-cutoff message must stop
+   * before even needing the Meta access token.
+   */
+  let accessToken: string | null = null
+
+  for (const message of messages) {
+    if (!message.id) {
+      console.warn(
+        '[coexistence-history] malformed media detail without message id'
+      )
+      continue
+    }
+
+    if (!supportedTypes.has(message.type)) {
+      console.info(
+        '[coexistence-history] unsupported media detail type ignored:',
+        message.type,
+        message.id
+      )
+      continue
+    }
+
+    const target =
+      await findCoexistenceHistoryMediaTarget(
+        config.account_id,
+        message.id
+      )
+
+    if (!target) {
+      continue
+    }
+
+    /*
+     * Only a row explicitly accepted from media_placeholder may be
+     * promoted by a history media-detail event.
+     *
+     * This also forms the retry fast-path: once resolved, pending=false
+     * and no Meta lookup/download happens again.
+     */
+    if (!target.history_media_pending) {
+      console.info(
+        '[coexistence-history] duplicate/resolved media detail ignored before media processing:',
+        message.id
+      )
+      continue
+    }
+
+    /*
+     * Defensive repair. This should normally not occur, but if the row
+     * already has media_url while pending=true, finish locally.
+     */
+    if (target.media_url) {
+      const { error: repairError } =
+        await supabaseAdmin()
+          .from('messages')
+          .update({
+            history_media_pending: false,
+          })
+          .eq('id', target.id)
+
+      if (repairError) {
+        console.error(
+          '[coexistence-history] media pending repair failed:',
+          message.id,
+          repairError
+        )
+      }
+
+      continue
+    }
+
+    if (!accessToken) {
+      try {
+        accessToken = decrypt(config.access_token)
+      } catch (error) {
+        console.error(
+          '[coexistence-history] access token decrypt failed:',
+          error
+        )
+        return
+      }
+    }
+
+    /*
+     * Reuse the existing verified Meta media path and chat-media mirror.
+     */
+    const {
+      contentText,
+      mediaUrl,
+      mediaType,
+    } = await parseMessageContent(
+      message,
+      accessToken,
+      config.mirror_inbound_media !== false
+        ? { accountId: config.account_id }
+        : null
+    )
+
+    const contentType =
+      message.type === 'sticker'
+        ? 'image'
+        : message.type
+
+    const resolved =
+      typeof mediaUrl === 'string' &&
+      mediaUrl.length > 0
+
+    const { error: updateError } =
+      await supabaseAdmin()
+        .from('messages')
+        .update({
+          content_type: contentType,
+          content_text: contentText,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          history_media_pending: !resolved,
+        })
+        .eq('id', target.id)
+        .eq('history_media_pending', true)
+
+    if (updateError) {
+      console.error(
+        '[coexistence-history] media detail update failed:',
+        message.id,
+        updateError
+      )
+      continue
+    }
+
+    /*
+     * Change the preview only if this historical message is still the
+     * newest message in the conversation. Never regress a later live
+     * message.
+     */
+    const { error: summaryError } =
+      await supabaseAdmin()
+        .from('conversations')
+        .update({
+          last_message_text:
+            contentText || `[${message.type}]`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', target.conversation_id)
+        .eq('last_message_at', target.created_at)
+
+    if (summaryError) {
+      console.error(
+        '[coexistence-history] media conversation summary update failed:',
+        target.conversation_id,
+        summaryError
+      )
+    }
+
+    if (resolved) {
+      console.info(
+        '[coexistence-history] historical media resolved:',
+        message.id,
+        message.type
+      )
+    } else {
+      console.warn(
+        '[coexistence-history] historical media detail stored but media resolution remains pending:',
+        message.id,
+        message.type
+      )
+    }
   }
 }
 
@@ -1043,14 +1291,18 @@ async function processCoexistenceHistory(
   }
 
   /*
-   * Meta also uses field=history for a later media-detail payload,
-   * where value.messages contains the actual media ID. We deliberately
-   * leave that path untouched in this first text-only checkpoint.
+   * Historical media arrives in two stages:
+   *
+   * 1. history[].threads[].messages[] -> media_placeholder
+   * 2. later field=history -> value.messages[] with the real Media ID
+   *
+   * Stage 2 is allowed only when stage 1 already created an accepted
+   * history_media_pending row.
    */
   if (value.messages?.length && !value.history?.length) {
-    console.info(
-      '[coexistence-history] media/detail payload deferred:',
-      value.messages.length
+    await processCoexistenceHistoryMediaDetails(
+      value,
+      config
     )
     return
   }
@@ -1119,21 +1371,35 @@ async function processCoexistenceHistory(
             return null
           }
 
-          // First checkpoint: text only.
-          // media_placeholder and media detail are handled next.
-          if (
-            message.type !== 'text' ||
-            typeof message.text?.body !==
-              'string'
-          ) {
-            unsupported += 1
-            return null
+          if (message.type === 'text') {
+            if (
+              typeof message.text?.body !==
+                'string'
+            ) {
+              malformed += 1
+              return null
+            }
+
+            return {
+              message,
+              createdAt,
+              isMediaPlaceholder: false,
+            }
           }
 
-          return {
-            message,
-            createdAt,
+          if (
+            message.type ===
+              'media_placeholder'
+          ) {
+            return {
+              message,
+              createdAt,
+              isMediaPlaceholder: true,
+            }
           }
+
+          unsupported += 1
+          return null
         })
         .filter(
           (
@@ -1141,6 +1407,7 @@ async function processCoexistenceHistory(
           ): item is {
             message: WhatsAppHistoryMessage
             createdAt: string
+            isMediaPlaceholder: boolean
           } => item !== null
         )
         .sort(
@@ -1223,8 +1490,11 @@ async function processCoexistenceHistory(
        * - message.received webhook
        */
       for (const item of accepted) {
-        const { message, createdAt } =
-          item
+        const {
+          message,
+          createdAt,
+          isMediaPlaceholder,
+        } = item
 
         if (!message.id) {
           malformed += 1
@@ -1243,7 +1513,9 @@ async function processCoexistenceHistory(
           senderPhone === businessPhone
 
         const contentText =
-          message.text?.body ?? null
+          isMediaPlaceholder
+            ? '[Historical media]'
+            : message.text?.body ?? null
 
         const status =
           mapCoexistenceHistoryStatus(
@@ -1264,10 +1536,17 @@ async function processCoexistenceHistory(
                 ? 'agent'
                 : 'customer',
               sender_id: null,
+              /*
+               * media_placeholder does not yet disclose the real type.
+               * Keep the row valid using text until the second webhook
+               * promotes it to image/video/document/audio.
+               */
               content_type: 'text',
               content_text: contentText,
               media_url: null,
               media_type: null,
+              history_media_pending:
+                isMediaPlaceholder,
               template_name: null,
               message_id: message.id,
               status,
@@ -1310,7 +1589,9 @@ async function processCoexistenceHistory(
               p_conversation_id:
                 conversation.id,
               p_last_message_text:
-                contentText || '[text]',
+                isMediaPlaceholder
+                  ? '[media]'
+                  : contentText || '[text]',
               p_last_message_at:
                 createdAt,
             }
