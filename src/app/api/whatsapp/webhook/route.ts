@@ -742,28 +742,6 @@ async function handleCoexistenceEdit(
 
   if (!target) return
 
-  if (target.revoked_at) {
-    console.info(
-      '[coexistence] edit ignored because target is revoked:',
-      edit.original_message_id
-    )
-    return
-  }
-
-  const editedAt = coexistenceEventTime(echo.timestamp)
-
-  if (
-    target.edited_at &&
-    new Date(target.edited_at).getTime() >=
-      new Date(editedAt).getTime()
-  ) {
-    console.info(
-      '[coexistence] stale/duplicate edit ignored:',
-      edit.original_message_id
-    )
-    return
-  }
-
   let contentText: string | null
 
   switch (edit.message.type) {
@@ -775,6 +753,7 @@ async function handleCoexistenceEdit(
         )
         return
       }
+
       contentText = edit.message.text.body
       break
 
@@ -799,16 +778,18 @@ async function handleCoexistenceEdit(
       return
   }
 
-  const { data: updatedRows, error } = await supabaseAdmin()
-    .from('messages')
-    .update({
-      content_text: contentText,
-      edited_at: editedAt,
-    })
-    .eq('id', target.id)
-    .is('revoked_at', null)
-    .or(`edited_at.is.null,edited_at.lt.${editedAt}`)
-    .select('id')
+  const editedAt = coexistenceEventTime(echo.timestamp)
+
+  const { data, error } = await supabaseAdmin().rpc(
+    'apply_whatsapp_message_edit',
+    {
+      p_message_id: target.id,
+      p_edit_event_id: echo.id,
+      p_new_content_text: contentText,
+      p_content_type: target.content_type,
+      p_edited_at: editedAt,
+    }
+  )
 
   if (error) {
     console.error(
@@ -818,10 +799,22 @@ async function handleCoexistenceEdit(
     return
   }
 
-  if (!updatedRows || updatedRows.length === 0) {
+  const outcome = (
+    Array.isArray(data) ? data[0] : data
+  ) as
+    | {
+        applied: boolean
+        reason: string
+        previous_content_text: string | null
+        current_content_text: string | null
+      }
+    | null
+
+  if (!outcome?.applied) {
     console.info(
-      '[coexistence] stale/duplicate edit ignored after race:',
-      edit.original_message_id
+      '[coexistence] app message edit ignored:',
+      edit.original_message_id,
+      outcome?.reason ?? 'unknown'
     )
     return
   }
