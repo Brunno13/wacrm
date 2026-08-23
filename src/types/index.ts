@@ -268,6 +268,17 @@ export interface Message {
   revoked_at?: string | null;
 }
 
+export interface MessageEditHistoryItem {
+  previous_content_text: string | null;
+  new_content_text: string | null;
+  content_type: ContentType;
+  edited_at: string;
+  created_at: string;
+}
+
+export type MessageEditHistories =
+  Record<string, MessageEditHistoryItem[]>;
+
 export type ReactionActor = 'customer' | 'agent';
 
 export interface MessageReaction {

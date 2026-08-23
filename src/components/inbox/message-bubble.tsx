@@ -1,7 +1,12 @@
 "use client";
 
+import { useState } from "react";
 import { cn } from "@/lib/utils";
-import type { Message, MessageReaction } from "@/types";
+import type {
+  Message,
+  MessageReaction,
+  MessageEditHistoryItem,
+} from "@/types";
 import {
   Clock,
   Check,
@@ -11,6 +16,10 @@ import {
   LayoutTemplate,
   CornerDownLeft,
   Sparkles,
+  Pencil,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
@@ -29,6 +38,7 @@ interface MessageBubbleProps {
   message: Message;
   /** Pre-computed quote info for messages that reply to another. */
   reply?: { authorLabel: string; preview: string } | null;
+  editHistory?: MessageEditHistoryItem[];
   reactions?: MessageReaction[];
   currentUserId?: string;
   onToggleReaction?: (emoji: string) => void;
@@ -69,9 +79,9 @@ function MessageContent({
   isAgent: boolean;
   onOpenMedia?: (messageId: string) => void;
 }) {
-  // Passed to the media bubbles as a no-arg callback; `undefined` when the
-  // parent wired up no viewer, which is what makes them non-clickable.
-  const openMedia = onOpenMedia ? () => onOpenMedia(message.id) : undefined;
+  const openMedia = onOpenMedia
+    ? () => onOpenMedia(message.id)
+    : undefined;
 
   switch (message.content_type) {
     case "text":
@@ -85,10 +95,15 @@ function MessageContent({
       return (
         <div>
           {message.media_url ? (
-            <MediaImageBubble message={message} onOpen={openMedia} t={t} />
+            <MediaImageBubble
+              message={message}
+              onOpen={openMedia}
+              t={t}
+            />
           ) : (
             <MediaUnavailable label={t("photo")} t={t} />
           )}
+
           {message.content_text && (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
               {message.content_text}
@@ -101,10 +116,15 @@ function MessageContent({
       return (
         <div>
           {message.media_url ? (
-            <MediaVideoBubble message={message} onOpen={openMedia} t={t} />
+            <MediaVideoBubble
+              message={message}
+              onOpen={openMedia}
+              t={t}
+            />
           ) : (
             <MediaUnavailable label={t("video")} t={t} />
           )}
+
           {message.content_text && (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
               {message.content_text}
@@ -126,18 +146,22 @@ function MessageContent({
 
     case "document":
       if (!message.media_url) {
-        return <MediaUnavailable label={message.content_text || t("document")} t={t} />;
+        return (
+          <MediaUnavailable
+            label={message.content_text || t("document")}
+            t={t}
+          />
+        );
       }
-      return <MediaDocumentBubble message={message} t={t} />;
+
+      return (
+        <MediaDocumentBubble
+          message={message}
+          t={t}
+        />
+      );
 
     case "template":
-      // Templates are almost always outbound, where the bubble fill IS
-      // `primary` — so the old `bg-primary/20 text-primary` chip was
-      // primary-on-primary and invisible. Paired with a null
-      // content_text (issue #483) that rendered a bubble with nothing
-      // in it at all. Invert on the primary fill, and fall back to the
-      // template's name when we have no stored body (legacy rows sent
-      // before the fix).
       return (
         <div>
           <span
@@ -151,6 +175,7 @@ function MessageContent({
             <LayoutTemplate className="h-3 w-3" />
             {t("template")}
           </span>
+
           {message.content_text ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
               {message.content_text}
@@ -169,23 +194,21 @@ function MessageContent({
       return (
         <div className="flex items-center gap-2 text-sm">
           <MapPin className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span>{message.content_text || t("locationShared")}</span>
+          <span>
+            {message.content_text || t("locationShared")}
+          </span>
         </div>
       );
 
     case "interactive": {
-      // Three cases share content_type='interactive':
-      //  - OUTBOUND with payload (composer / automation / Flow send after
-      //    migration 035): render the buttons/list as they appear on the phone.
-      //  - INBOUND tap (customer chose an option, sender_type='customer'):
-      //    no payload; show the tapped option's title with a reply affordance
-      //    so agents can tell it's a tap, not the customer typing.
-      //  - OUTBOUND with NO payload (legacy bot/Flow sends from before
-      //    migration 035 backfilled the column): show the body text plainly —
-      //    it is our own message, NOT a customer tap.
       if (message.interactive_payload) {
-        return <InteractivePreview payload={message.interactive_payload} />;
+        return (
+          <InteractivePreview
+            payload={message.interactive_payload}
+          />
+        );
       }
+
       if (message.sender_type === "customer") {
         return (
           <div className="flex flex-col gap-0.5">
@@ -193,12 +216,14 @@ function MessageContent({
               <CornerDownLeft className="h-3 w-3" />
               {t("buttonReply")}
             </span>
+
             <p className="whitespace-pre-wrap break-words text-sm">
               {message.content_text || t("interactiveReply")}
             </p>
           </div>
         );
       }
+
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
           {message.content_text || t("interactiveReply")}
@@ -218,18 +243,44 @@ function MessageContent({
 export function MessageBubble({
   message,
   reply,
+  editHistory = [],
   reactions,
   currentUserId,
   onToggleReaction,
   onOpenMedia,
 }: MessageBubbleProps) {
   const t = useTranslations("Inbox.bubble");
+  const [historyOpen, setHistoryOpen] = useState(false);
 
-  const isAgent = message.sender_type === "agent" || message.sender_type === "bot";
-  const time = format(new Date(message.created_at), "HH:mm");
+  const isAgent =
+    message.sender_type === "agent" ||
+    message.sender_type === "bot";
 
-  // Row alignment + width cap are owned by <MessageActions> so its hover
-  // group matches the bubble's content area, not the full row.
+  const time = format(
+    new Date(message.created_at),
+    "HH:mm",
+  );
+
+  const editCount = editHistory.length;
+
+  const originalContent =
+    editHistory[0]?.previous_content_text ?? null;
+
+  /*
+   * A -> B -> C
+   *
+   * Original box: A
+   * Expanded intermediate history: B
+   * Normal MessageContent: C
+   *
+   * The final transition is not rendered separately because
+   * messages.content_text already contains the current version.
+   */
+  const intermediateEdits =
+    editHistory.length > 1
+      ? editHistory.slice(0, -1)
+      : [];
+
   return (
     <div
       className={cn(
@@ -252,22 +303,138 @@ export function MessageBubble({
             onPrimary={isAgent}
           />
         )}
+
+        {editCount > 0 && (
+          <div
+            className={cn(
+              "mb-2 rounded-lg border px-2.5 py-2",
+              isAgent
+                ? "border-primary-foreground/20 bg-primary-foreground/10"
+                : "border-border bg-background/50",
+            )}
+          >
+            <div
+              className={cn(
+                "mb-1 text-[10px] font-semibold uppercase tracking-wide",
+                isAgent
+                  ? "text-primary-foreground/70"
+                  : "text-muted-foreground",
+              )}
+            >
+              {t("originalVersion")}
+            </div>
+
+            <p className="whitespace-pre-wrap break-words text-xs opacity-80">
+              {originalContent ||
+                t("emptyEditedContent")}
+            </p>
+          </div>
+        )}
+
+        {historyOpen &&
+          intermediateEdits.length > 0 && (
+            <div className="mb-2 space-y-2">
+              {intermediateEdits.map(
+                (edit, index) => (
+                  <div
+                    key={`${edit.edited_at}-${index}`}
+                    className={cn(
+                      "rounded-lg border px-2.5 py-2",
+                      isAgent
+                        ? "border-primary-foreground/20 bg-primary-foreground/10"
+                        : "border-border bg-background/50",
+                    )}
+                  >
+                    <div
+                      className={cn(
+                        "mb-1 text-[10px] font-medium",
+                        isAgent
+                          ? "text-primary-foreground/70"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      {t("editedAt", {
+                        time: format(
+                          new Date(edit.edited_at),
+                          "HH:mm",
+                        ),
+                      })}
+                    </div>
+
+                    <p className="whitespace-pre-wrap break-words text-xs opacity-80">
+                      {edit.new_content_text ||
+                        t("emptyEditedContent")}
+                    </p>
+                  </div>
+                ),
+              )}
+            </div>
+          )}
+
         <MessageContent
           message={message}
           t={t}
           isAgent={isAgent}
           onOpenMedia={onOpenMedia}
         />
+
+        {editCount > 1 && (
+          <button
+            type="button"
+            onClick={() =>
+              setHistoryOpen((open) => !open)
+            }
+            className={cn(
+              "mt-2 inline-flex items-center gap-1 text-[10px] font-medium underline-offset-2 hover:underline",
+              isAgent
+                ? "text-primary-foreground/75"
+                : "text-muted-foreground",
+            )}
+          >
+            {historyOpen ? (
+              <ChevronUp className="h-3 w-3" />
+            ) : (
+              <ChevronDown className="h-3 w-3" />
+            )}
+
+            {historyOpen
+              ? t("hideEditHistory")
+              : t("showEditHistory", {
+                  count: intermediateEdits.length,
+                })}
+          </button>
+        )}
+
+        {message.revoked_at && (
+          <div
+            className={cn(
+              "mt-2 flex items-center gap-1 border-t pt-1.5 text-[10px] font-medium",
+              isAgent
+                ? "border-primary-foreground/20 text-primary-foreground/75"
+                : "border-border text-muted-foreground",
+            )}
+          >
+            <Trash2 className="h-3 w-3 shrink-0" />
+
+            <span>
+              {t("deletedInWhatsApp", {
+                time: format(
+                  new Date(message.revoked_at),
+                  "HH:mm",
+                ),
+              })}
+            </span>
+          </div>
+        )}
+
         <div
           className={cn(
             "mt-1 flex items-center gap-1",
-            isAgent ? "justify-end" : "justify-start",
+            isAgent
+              ? "justify-end"
+              : "justify-start",
           )}
         >
-          {/* AI badge — only on replies the auto-reply bot generated
-              (always outbound, so it sits on the primary fill). Lets
-              agents tell an AI reply from their own / a Flow's at a
-              glance. */}
           {message.ai_generated && (
             <span
               className="inline-flex items-center gap-0.5 rounded-full bg-primary-foreground/20 px-1.5 py-px text-[9px] font-semibold uppercase leading-none tracking-wide text-primary-foreground"
@@ -277,26 +444,52 @@ export function MessageBubble({
               {t("aiBadge")}
             </span>
           )}
+
+          {message.edited_at && (
+            <span
+              className={cn(
+                "inline-flex items-center gap-0.5 text-[10px]",
+                isAgent
+                  ? "text-primary-foreground/70"
+                  : "text-muted-foreground",
+              )}
+            >
+              <Pencil className="h-2.5 w-2.5" />
+
+              {editCount > 1
+                ? t("editCount", {
+                    count: editCount,
+                  })
+                : t("edited")}
+            </span>
+          )}
+
           <span
             className={cn(
               "text-[10px]",
-              // Outbound bubbles sit on the primary fill, so the
-              // timestamp must read against that (not the neutral
-              // foreground) — otherwise it goes low-contrast in light
-              // mode. Inbound bubbles use the muted surface.
-              isAgent ? "text-primary-foreground/70" : "text-muted-foreground",
+              isAgent
+                ? "text-primary-foreground/70"
+                : "text-muted-foreground",
             )}
           >
             {time}
           </span>
-          {isAgent && <StatusIcon status={message.status} />}
+
+          {isAgent && (
+            <StatusIcon status={message.status} />
+          )}
         </div>
       </div>
-      {reactions && reactions.length > 0 && onToggleReaction && (
+
+      {reactions && reactions.length > 0 && (
         <MessageReactions
           reactions={reactions}
           currentUserId={currentUserId}
-          onToggle={onToggleReaction}
+          onToggle={
+            message.revoked_at
+              ? undefined
+              : onToggleReaction
+          }
         />
       )}
     </div>

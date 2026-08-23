@@ -16,6 +16,7 @@ import type {
   MessageTemplate,
   Profile,
   InteractiveMessagePayload,
+  MessageEditHistories,
 } from "@/types";
 import {
   MessageSquare,
@@ -175,6 +176,8 @@ export function MessageThread({
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [reactions, setReactions] = useState<MessageReaction[]>([]);
+  const [messageEditHistories, setMessageEditHistories] =
+    useState<MessageEditHistories>({});
   // Purely visual spin state for the manual-refresh button. The actual
   // refetch is fire-and-forget through `onRefresh` (which bumps the
   // parent's resyncToken); the 700ms spin is just feedback so the click
@@ -273,6 +276,17 @@ export function MessageThread({
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
+  // Normal messages do not change edit history. Reload only when an
+  // edited_at value changes, the conversation changes or resync runs.
+  const editHistoryVersion = useMemo(
+    () =>
+      messages
+        .filter((message) => message.edited_at)
+        .map((message) => `${message.id}:${message.edited_at}`)
+        .join("|"),
+    [messages],
+  );
+
   const mediaMessageId =
     openMedia && openMedia.conversationId === conversationId
       ? openMedia.messageId
@@ -324,6 +338,63 @@ export function MessageThread({
     // realtime is best-effort and any message events sent while the WS
     // was disconnected or throttled are otherwise lost.
   }, [conversationId, resyncToken]);
+
+  // Edit history is intentionally exposed through the authenticated
+  // server route instead of direct browser access to message_edits.
+  // One request loads the whole active conversation — never one request
+  // per message bubble.
+  useEffect(() => {
+    if (!conversationId) {
+      setMessageEditHistories({});
+      return;
+    }
+
+    let cancelled = false;
+
+    // Do not let history from the previous conversation remain visible
+    // while the new conversation is loading.
+    setMessageEditHistories({});
+
+    (async () => {
+      try {
+        const response = await fetch(
+          `/api/conversations/${encodeURIComponent(
+            conversationId,
+          )}/message-edits`,
+          { cache: "no-store" },
+        );
+
+        if (cancelled) return;
+
+        if (!response.ok) {
+          console.error(
+            "Failed to fetch message edit history:",
+            response.status,
+          );
+          return;
+        }
+
+        const payload = (await response.json()) as {
+          histories?: MessageEditHistories;
+        };
+
+        if (!cancelled) {
+          setMessageEditHistories(payload.histories ?? {});
+        }
+      } catch (error) {
+        if (cancelled) return;
+
+        console.error(
+          "Failed to fetch message edit history:",
+          error,
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, resyncToken, editHistoryVersion]);
 
   // Reactions fetch — pulls the current state from the DB. Kept separate
   // from the channel subscription below so a `resyncToken` bump just
@@ -1141,6 +1212,7 @@ export function MessageThread({
                         <MessageBubble
                           message={msg}
                           reply={reply}
+                          editHistory={messageEditHistories[msg.id] ?? []}
                           reactions={msgReactions}
                           currentUserId={user?.id}
                           onToggleReaction={handlePillToggle}

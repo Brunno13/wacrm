@@ -7,9 +7,14 @@ import type { MessageReaction } from "@/types";
 interface MessageReactionsProps {
   reactions: MessageReaction[];
   currentUserId: string | undefined;
-  /** Toggle the agent's reaction. If the agent already has this emoji →
-   *  caller should send empty to remove; otherwise swap/add. */
-  onToggle: (emoji: string) => void;
+
+  /**
+   * Undefined means read-only.
+   *
+   * Revoked WhatsApp messages keep historical reactions visible,
+   * but the CRM must not create/remove reactions on them.
+   */
+  onToggle?: (emoji: string) => void;
 }
 
 interface ReactionGroup {
@@ -23,19 +28,28 @@ function groupReactions(
   currentUserId: string | undefined,
 ): ReactionGroup[] {
   const map = new Map<string, ReactionGroup>();
-  for (const r of reactions) {
-    const existing = map.get(r.emoji);
+
+  for (const reaction of reactions) {
+    const existing = map.get(reaction.emoji);
+
     const isMine =
-      r.actor_type === "agent" &&
+      reaction.actor_type === "agent" &&
       !!currentUserId &&
-      r.actor_id === currentUserId;
+      reaction.actor_id === currentUserId;
+
     if (existing) {
       existing.count += 1;
-      existing.byCurrentUser = existing.byCurrentUser || isMine;
+      existing.byCurrentUser =
+        existing.byCurrentUser || isMine;
     } else {
-      map.set(r.emoji, { emoji: r.emoji, count: 1, byCurrentUser: isMine });
+      map.set(reaction.emoji, {
+        emoji: reaction.emoji,
+        count: 1,
+        byCurrentUser: isMine,
+      });
     }
   }
+
   return [...map.values()];
 }
 
@@ -45,29 +59,49 @@ export function MessageReactions({
   onToggle,
 }: MessageReactionsProps) {
   const groups = useMemo(
-    () => groupReactions(reactions, currentUserId),
+    () =>
+      groupReactions(
+        reactions,
+        currentUserId,
+      ),
     [reactions, currentUserId],
   );
 
-  if (groups.length === 0) return null;
+  if (groups.length === 0) {
+    return null;
+  }
 
   return (
     <div className="mt-1 flex flex-wrap gap-1">
-      {groups.map((g) => (
+      {groups.map((group) => (
         <button
-          key={g.emoji}
+          key={group.emoji}
           type="button"
-          onClick={() => onToggle(g.emoji)}
-          aria-pressed={g.byCurrentUser}
+          disabled={!onToggle}
+          onClick={() =>
+            onToggle?.(group.emoji)
+          }
+          aria-pressed={group.byCurrentUser}
           className={cn(
             "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[11px] leading-none transition-colors",
-            g.byCurrentUser
-              ? "border-primary/60 bg-primary/15 text-primary hover:bg-primary/25"
-              : "border-border bg-muted/80 text-foreground hover:bg-muted",
+            !onToggle &&
+              "cursor-default opacity-75",
+            group.byCurrentUser
+              ? "border-primary/60 bg-primary/15 text-primary"
+              : "border-border bg-muted/80 text-foreground",
+            onToggle &&
+              (group.byCurrentUser
+                ? "hover:bg-primary/25"
+                : "hover:bg-muted"),
           )}
         >
-          <span className="text-sm leading-none">{g.emoji}</span>
-          {g.count > 1 && <span>{g.count}</span>}
+          <span className="text-sm leading-none">
+            {group.emoji}
+          </span>
+
+          {group.count > 1 && (
+            <span>{group.count}</span>
+          )}
         </button>
       ))}
     </div>
