@@ -13,12 +13,23 @@ import { mediaFilename } from "./filename";
  * `loadMediaBlob` if the thumbnail or lightbox pulled it) and full control
  * over the filename.
  *
+ * Mirrored chat-media URLs may point to an internal HTTP Supabase origin
+ * while WACrm itself is served over HTTPS. Those downloads are routed
+ * through WACrm so the browser only sees same-origin HTTPS.
+ *
  * Throws so the caller can toast; the only silent path is the new-tab
  * fallback below.
  */
 export async function downloadMediaMessage(message: Message): Promise<void> {
   const url = message.media_url;
   if (!url) throw new Error("This message has no attachment.");
+
+  if (isChatMediaBucketUrl(url)) {
+    clickAnchor({
+      href: `/api/media/download/${encodeURIComponent(message.id)}`,
+    });
+    return;
+  }
 
   let blob: Blob;
   try {
@@ -28,6 +39,7 @@ export async function downloadMediaMessage(message: Message): Promise<void> {
     // expired 401s here, and quietly opening a tab onto that error would
     // hide it. Let the caller toast instead.
     if (error instanceof MediaResponseError) throw error;
+
     // A fetch that never completed is the other case: a bucket with a
     // stricter CORS policy than ours can block the XHR while the browser
     // is still perfectly able to navigate to the object. Handing the URL
@@ -49,6 +61,17 @@ export async function downloadMediaMessage(message: Message): Promise<void> {
   }
 }
 
+function isChatMediaBucketUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url, "http://media.invalid");
+    return parsed.pathname.startsWith(
+      "/storage/v1/object/public/chat-media/",
+    );
+  } catch {
+    return false;
+  }
+}
+
 function openInNewTab(url: string): boolean {
   if (typeof document === "undefined") return false;
   clickAnchor({ href: url, target: "_blank" });
@@ -67,11 +90,14 @@ function clickAnchor(attrs: {
 }): void {
   const a = document.createElement("a");
   a.href = attrs.href;
+
   if (attrs.download) a.download = attrs.download;
+
   if (attrs.target) {
     a.target = attrs.target;
     a.rel = "noopener noreferrer";
   }
+
   a.style.display = "none";
   document.body.appendChild(a);
   a.click();
