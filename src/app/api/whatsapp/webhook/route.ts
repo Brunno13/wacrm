@@ -72,8 +72,23 @@ interface WhatsAppMessage {
   context?: { id: string }
 }
 
+interface WhatsAppEditedMessage {
+  type: string
+  text?: { body: string }
+  image?: { caption?: string }
+  video?: { caption?: string }
+  document?: { caption?: string }
+}
+
 interface WhatsAppMessageEcho extends WhatsAppMessage {
   to: string
+  edit?: {
+    original_message_id: string
+    message: WhatsAppEditedMessage
+  }
+  revoke?: {
+    original_message_id: string
+  }
 }
 
 interface WhatsAppWebhookEntry {
@@ -602,6 +617,296 @@ type WhatsAppWebhookValue =
  * - no inbound automations, Flows or AI dispatch;
  * - idempotent on (conversation_id, message_id).
  */
+interface CoexistenceLifecycleTarget {
+  id: string
+  conversation_id: string
+  content_type: string
+  content_text: string | null
+  created_at: string | null
+  edited_at: string | null
+  revoked_at: string | null
+}
+
+function coexistenceEventTime(timestamp: string): string {
+  const seconds = Number.parseInt(timestamp, 10)
+
+  if (!Number.isFinite(seconds)) {
+    return new Date().toISOString()
+  }
+
+  const date = new Date(seconds * 1000)
+
+  if (!Number.isFinite(date.getTime())) {
+    return new Date().toISOString()
+  }
+
+  return date.toISOString()
+}
+
+/**
+ * Resolve a lifecycle event directly to an outbound message already
+ * stored in this account.
+ *
+ * edit/revoke must never create a contact or conversation. This is
+ * especially important once historical import has a cutoff: lifecycle
+ * events can legitimately reference messages we intentionally did not
+ * import.
+ */
+async function findCoexistenceLifecycleTarget(
+  accountId: string,
+  originalMessageId: string
+): Promise<CoexistenceLifecycleTarget | null> {
+  const { data: rows, error } = await supabaseAdmin()
+    .from('messages')
+    .select(
+      'id, conversation_id, content_type, content_text, created_at, edited_at, revoked_at, conversations!inner(account_id)'
+    )
+    .eq('message_id', originalMessageId)
+    .eq('sender_type', 'agent')
+    .eq('conversations.account_id', accountId)
+    .limit(2)
+
+  if (error) {
+    console.error(
+      '[coexistence] error locating lifecycle target:',
+      error
+    )
+    return null
+  }
+
+  if (!rows || rows.length === 0) {
+    console.info(
+      '[coexistence] lifecycle target not present locally; ignored:',
+      originalMessageId
+    )
+    return null
+  }
+
+  if (rows.length > 1) {
+    console.error(
+      '[coexistence] ambiguous lifecycle target; ignored:',
+      originalMessageId
+    )
+    return null
+  }
+
+  return rows[0] as CoexistenceLifecycleTarget
+}
+
+/**
+ * Change the Inbox preview only if this message is still the latest
+ * message in the conversation. The last_message_at predicate prevents
+ * an old edit/revoke from overwriting the preview of a newer message.
+ */
+async function updateCoexistenceConversationSummary(
+  target: CoexistenceLifecycleTarget,
+  summary: string
+) {
+  if (!target.created_at) return
+
+  const { error } = await supabaseAdmin()
+    .from('conversations')
+    .update({
+      last_message_text: summary,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', target.conversation_id)
+    .eq('last_message_at', target.created_at)
+
+  if (error) {
+    console.error(
+      '[coexistence] error updating lifecycle conversation summary:',
+      error
+    )
+  }
+}
+
+async function handleCoexistenceEdit(
+  echo: WhatsAppMessageEcho,
+  accountId: string
+) {
+  const edit = echo.edit
+
+  if (!edit?.original_message_id || !edit.message) {
+    console.warn(
+      '[coexistence] malformed edit echo ignored:',
+      echo.id
+    )
+    return
+  }
+
+  const target = await findCoexistenceLifecycleTarget(
+    accountId,
+    edit.original_message_id
+  )
+
+  if (!target) return
+
+  if (target.revoked_at) {
+    console.info(
+      '[coexistence] edit ignored because target is revoked:',
+      edit.original_message_id
+    )
+    return
+  }
+
+  const editedAt = coexistenceEventTime(echo.timestamp)
+
+  if (
+    target.edited_at &&
+    new Date(target.edited_at).getTime() >=
+      new Date(editedAt).getTime()
+  ) {
+    console.info(
+      '[coexistence] stale/duplicate edit ignored:',
+      edit.original_message_id
+    )
+    return
+  }
+
+  let contentText: string | null
+
+  switch (edit.message.type) {
+    case 'text':
+      if (typeof edit.message.text?.body !== 'string') {
+        console.warn(
+          '[coexistence] text edit without body ignored:',
+          echo.id
+        )
+        return
+      }
+      contentText = edit.message.text.body
+      break
+
+    case 'image':
+      contentText = edit.message.image?.caption ?? null
+      break
+
+    case 'video':
+      contentText = edit.message.video?.caption ?? null
+      break
+
+    case 'document':
+      contentText = edit.message.document?.caption ?? null
+      break
+
+    default:
+      console.info(
+        '[coexistence] unsupported edited content type ignored:',
+        edit.message.type,
+        echo.id
+      )
+      return
+  }
+
+  const { data: updatedRows, error } = await supabaseAdmin()
+    .from('messages')
+    .update({
+      content_text: contentText,
+      edited_at: editedAt,
+    })
+    .eq('id', target.id)
+    .is('revoked_at', null)
+    .or(`edited_at.is.null,edited_at.lt.${editedAt}`)
+    .select('id')
+
+  if (error) {
+    console.error(
+      '[coexistence] error applying app message edit:',
+      error
+    )
+    return
+  }
+
+  if (!updatedRows || updatedRows.length === 0) {
+    console.info(
+      '[coexistence] stale/duplicate edit ignored after race:',
+      edit.original_message_id
+    )
+    return
+  }
+
+  await updateCoexistenceConversationSummary(
+    target,
+    contentText || `[${target.content_type}]`
+  )
+
+  console.info(
+    '[coexistence] WhatsApp Business App edit applied:',
+    edit.original_message_id
+  )
+}
+
+async function handleCoexistenceRevoke(
+  echo: WhatsAppMessageEcho,
+  accountId: string
+) {
+  const originalMessageId = echo.revoke?.original_message_id
+
+  if (!originalMessageId) {
+    console.warn(
+      '[coexistence] malformed revoke echo ignored:',
+      echo.id
+    )
+    return
+  }
+
+  const target = await findCoexistenceLifecycleTarget(
+    accountId,
+    originalMessageId
+  )
+
+  if (!target) return
+
+  if (target.revoked_at) {
+    console.info(
+      '[coexistence] duplicate revoke ignored:',
+      originalMessageId
+    )
+    return
+  }
+
+  const revokedAt = coexistenceEventTime(echo.timestamp)
+
+  const { data: updatedRows, error } = await supabaseAdmin()
+    .from('messages')
+    .update({
+      revoked_at: revokedAt,
+    })
+    .eq('id', target.id)
+    .is('revoked_at', null)
+    .select('id')
+
+  if (error) {
+    console.error(
+      '[coexistence] error applying app message revoke:',
+      error
+    )
+    return
+  }
+
+  if (!updatedRows || updatedRows.length === 0) {
+    console.info(
+      '[coexistence] duplicate revoke ignored after race:',
+      originalMessageId
+    )
+    return
+  }
+
+  // Preserve content_text, media_url and the Storage object.
+  // The UI will hide revoked content; physical retention can be handled
+  // later by an explicit garbage-collection policy.
+  await updateCoexistenceConversationSummary(
+    target,
+    '[message deleted]'
+  )
+
+  console.info(
+    '[coexistence] WhatsApp Business App message revoked:',
+    originalMessageId
+  )
+}
+
 async function processMessageEchoes(value: WhatsAppWebhookValue) {
   const phoneNumberId = value.metadata.phone_number_id
   const echoes = value.message_echoes ?? []
@@ -651,8 +956,25 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
   ])
 
   for (const echo of echoes) {
-    if (!echo.id || !echo.to) {
+    if (!echo.id) {
       console.warn('[coexistence] malformed message echo ignored')
+      continue
+    }
+
+    // Lifecycle echoes update an existing message only. They must not
+    // create contacts, conversations or new visible message rows.
+    if (echo.type === 'edit') {
+      await handleCoexistenceEdit(echo, config.account_id)
+      continue
+    }
+
+    if (echo.type === 'revoke') {
+      await handleCoexistenceRevoke(echo, config.account_id)
+      continue
+    }
+
+    if (!echo.to) {
+      console.warn('[coexistence] message echo without customer phone ignored')
       continue
     }
 
