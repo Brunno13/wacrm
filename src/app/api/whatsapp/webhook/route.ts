@@ -72,6 +72,10 @@ interface WhatsAppMessage {
   context?: { id: string }
 }
 
+interface WhatsAppMessageEcho extends WhatsAppMessage {
+  to: string
+}
+
 interface WhatsAppWebhookEntry {
   id: string
   changes: Array<{
@@ -86,6 +90,7 @@ interface WhatsAppWebhookEntry {
         wa_id: string
       }>
       messages?: WhatsAppMessage[]
+      message_echoes?: WhatsAppMessageEcho[]
       statuses?: Array<{
         id: string
         status: string
@@ -251,6 +256,16 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         for (const status of value.statuses) {
           await handleStatusUpdate(status)
         }
+      }
+
+      // WhatsApp Coexistence: messages sent by the business from the
+      // WhatsApp Business App are delivered separately from normal
+      // customer inbound messages.
+      if (change.field === 'smb_message_echoes') {
+        if (value.message_echoes?.length) {
+          await processMessageEchoes(value)
+        }
+        continue
       }
 
       // Handle incoming messages
@@ -569,6 +584,208 @@ async function handleReaction(
     )
   if (upsertError) {
     console.error('[webhook] reaction upsert failed:', upsertError.message)
+  }
+}
+
+
+type WhatsAppWebhookValue =
+  WhatsAppWebhookEntry['changes'][number]['value']
+
+/**
+ * Persist messages sent by a human from the WhatsApp Business App
+ * while the number is operating in Meta WhatsApp Coexistence mode.
+ *
+ * MVP:
+ * - text echoes only;
+ * - stored as outbound/agent;
+ * - no unread increment;
+ * - no inbound automations, Flows or AI dispatch;
+ * - idempotent on (conversation_id, message_id).
+ */
+async function processMessageEchoes(value: WhatsAppWebhookValue) {
+  const phoneNumberId = value.metadata.phone_number_id
+  const echoes = value.message_echoes ?? []
+
+  if (!phoneNumberId || echoes.length === 0) return
+
+  const { data: configRows, error: configError } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('*')
+    .eq('phone_number_id', phoneNumberId)
+
+  if (configError) {
+    console.error(
+      '[coexistence] error fetching whatsapp_config for phone_number_id:',
+      phoneNumberId,
+      configError
+    )
+    return
+  }
+
+  if (!configRows || configRows.length === 0) {
+    console.error(
+      '[coexistence] no config found for phone_number_id:',
+      phoneNumberId
+    )
+    return
+  }
+
+  if (configRows.length > 1) {
+    console.error(
+      `[coexistence] multiple configs (${configRows.length}) found for phone_number_id:`,
+      phoneNumberId
+    )
+    return
+  }
+
+  const config = configRows[0]
+
+  for (const echo of echoes) {
+    if (!echo.id || !echo.to) {
+      console.warn('[coexistence] malformed message echo ignored')
+      continue
+    }
+
+    // First implementation is intentionally restricted to plain text.
+    if (echo.type !== 'text') {
+      console.info(
+        '[coexistence] unsupported app echo type ignored for now:',
+        echo.type,
+        echo.id
+      )
+      continue
+    }
+
+    const peerPhone = normalizePhone(echo.to)
+
+    if (!peerPhone) {
+      console.warn(
+        '[coexistence] message echo has invalid customer phone:',
+        echo.id
+      )
+      continue
+    }
+
+    // message_echoes do not reliably contain contacts/profile.name.
+    // Preserve an existing CRM contact name when possible.
+    const existingContact = await findExistingContact(
+      supabaseAdmin(),
+      config.account_id,
+      peerPhone
+    )
+
+    const contactOutcome: ContactOutcome | null = existingContact
+      ? {
+          contact: existingContact,
+          wasCreated: false,
+        }
+      : await findOrCreateContact(
+          config.account_id,
+          config.user_id,
+          peerPhone,
+          peerPhone
+        )
+
+    if (!contactOutcome) continue
+
+    const contactRecord = contactOutcome.contact
+
+    const convResult = await findOrCreateConversation(
+      config.account_id,
+      config.user_id,
+      contactRecord.id
+    )
+
+    if (!convResult) continue
+
+    const conversation = convResult.conversation
+
+    if (convResult.created) {
+      await dispatchWebhookEvent(
+        supabaseAdmin(),
+        config.account_id,
+        'conversation.created',
+        {
+          conversation_id: conversation.id,
+          contact_id: contactRecord.id,
+        }
+      )
+    }
+
+    const timestampSeconds = Number.parseInt(echo.timestamp, 10)
+
+    const createdAt = Number.isFinite(timestampSeconds)
+      ? new Date(timestampSeconds * 1000).toISOString()
+      : new Date().toISOString()
+
+    const contentText = echo.text?.body ?? ''
+
+    const { data: insertedRows, error: msgError } = await supabaseAdmin()
+      .from('messages')
+      .upsert(
+        {
+          conversation_id: conversation.id,
+          sender_type: 'agent',
+          sender_id: null,
+          content_type: 'text',
+          content_text: contentText || null,
+          media_url: null,
+          media_type: null,
+          template_name: null,
+          message_id: echo.id,
+          status: 'sent',
+          created_at: createdAt,
+        },
+        {
+          onConflict: 'conversation_id,message_id',
+          ignoreDuplicates: true,
+        }
+      )
+      .select('id')
+
+    if (msgError) {
+      console.error(
+        '[coexistence] error inserting WhatsApp Business App echo:',
+        msgError
+      )
+      continue
+    }
+
+    // Meta may retry the same echo. Nothing below this point may run
+    // again for an already-persisted message.
+    if (!insertedRows || insertedRows.length === 0) {
+      console.info(
+        '[coexistence] duplicate app echo ignored:',
+        echo.id
+      )
+      continue
+    }
+
+    // Outbound human message:
+    // - refresh conversation summary;
+    // - do NOT increase unread_count;
+    // - pause AI auto-reply on this conversation.
+    const { error: convError } = await supabaseAdmin()
+      .from('conversations')
+      .update({
+        last_message_text: contentText || '[text]',
+        last_message_at: createdAt,
+        updated_at: new Date().toISOString(),
+        ai_autoreply_disabled: true,
+      })
+      .eq('id', conversation.id)
+
+    if (convError) {
+      console.error(
+        '[coexistence] error updating conversation after app echo:',
+        convError
+      )
+    }
+
+    console.info(
+      '[coexistence] WhatsApp Business App echo persisted:',
+      echo.id
+    )
   }
 }
 
