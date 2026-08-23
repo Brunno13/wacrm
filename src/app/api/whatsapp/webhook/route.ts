@@ -721,6 +721,24 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       )
     }
 
+    // Fast-path for Meta retries. Avoid resolving/downloading/mirroring
+    // media when this exact message was already persisted.
+    //
+    // Keep the UPSERT below as the authoritative idempotency boundary:
+    // concurrent deliveries can both miss this preliminary lookup.
+    const existingEchoId = await lookupInternalIdByMetaId(
+      echo.id,
+      conversation.id
+    )
+
+    if (existingEchoId) {
+      console.info(
+        '[coexistence] duplicate app echo ignored before media processing:',
+        echo.id
+      )
+      continue
+    }
+
     const timestampSeconds = Number.parseInt(echo.timestamp, 10)
 
     const createdAt = Number.isFinite(timestampSeconds)
