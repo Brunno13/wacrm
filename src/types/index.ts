@@ -258,6 +258,14 @@ export interface Message {
    * badge in the inbox. Migration 033.
    */
   ai_generated?: boolean;
+  /**
+   * WhatsApp Coexistence lifecycle metadata.
+   * `edited_at` is updated only by accepted edit events.
+   * `revoked_at` marks a message deleted from WhatsApp without erasing
+   * the stored row.
+   */
+  edited_at?: string | null;
+  revoked_at?: string | null;
 }
 
 export type ReactionActor = 'customer' | 'agent';
@@ -289,6 +297,10 @@ export interface WhatsAppConfig {
   registered_at?: string;
   /** Set when POST /{waba_id}/subscribed_apps last succeeded. */
   subscribed_apps_at?: string;
+  /**
+   * Coexistence history cutoff. NULL means historical import is disabled.
+   */
+  coexistence_history_from?: string | null;
   /** Last error from /register; cleared on success. */
   last_registration_error?: string;
   /**
