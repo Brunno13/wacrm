@@ -80,6 +80,19 @@ interface WhatsAppEditedMessage {
   document?: { caption?: string }
 }
 
+interface WhatsAppAppStateSyncItem {
+  type: string
+  action?: string
+  contact?: {
+    full_name?: string
+    first_name?: string
+    phone_number?: string
+  }
+  metadata?: {
+    timestamp?: string
+  }
+}
+
 interface WhatsAppHistoryMessage extends WhatsAppMessage {
   to?: string
   history_context?: {
@@ -134,6 +147,7 @@ interface WhatsAppWebhookEntry {
       messages?: WhatsAppMessage[]
       message_echoes?: WhatsAppMessageEcho[]
       history?: WhatsAppHistoryChunk[]
+      state_sync?: WhatsAppAppStateSyncItem[]
       statuses?: Array<{
         id: string
         status: string
@@ -299,6 +313,15 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       // automations, Flows, AI and public webhook fan-out.
       if (change.field === 'history') {
         await processCoexistenceHistory(value)
+        continue
+      }
+
+      // WhatsApp Business App address-book synchronization.
+      //
+      // This creates/enriches CRM contacts but deliberately never
+      // creates conversations or dispatches automations/AI/Flows.
+      if (change.field === 'smb_app_state_sync') {
+        await processCoexistenceAppStateSync(value)
         continue
       }
 
@@ -949,6 +972,166 @@ function strictCoexistenceEventTime(
   if (!Number.isFinite(date.getTime())) return null
 
   return date.toISOString()
+}
+
+async function processCoexistenceAppStateSync(
+  value: WhatsAppWebhookValue
+) {
+  const phoneNumberId =
+    value.metadata.phone_number_id
+
+  const stateSync =
+    value.state_sync ?? []
+
+  if (!phoneNumberId) {
+    console.warn(
+      '[coexistence-state-sync] missing phone_number_id; ignored'
+    )
+    return
+  }
+
+  if (stateSync.length === 0) {
+    console.info(
+      '[coexistence-state-sync] empty state_sync payload ignored'
+    )
+    return
+  }
+
+  const { data: configRows, error: configError } =
+    await supabaseAdmin()
+      .from('whatsapp_config')
+      .select('account_id, user_id')
+      .eq('phone_number_id', phoneNumberId)
+
+  if (configError) {
+    console.error(
+      '[coexistence-state-sync] config lookup failed:',
+      phoneNumberId,
+      configError
+    )
+    return
+  }
+
+  if (!configRows || configRows.length !== 1) {
+    console.error(
+      '[coexistence-state-sync] expected exactly one config:',
+      phoneNumberId,
+      'rows=',
+      configRows?.length ?? 0
+    )
+    return
+  }
+
+  const config = configRows[0]
+
+  const sanitized: Array<{
+    phone: string
+    action: 'add' | 'remove'
+    full_name: string | null
+    first_name: string | null
+    event_at: string
+  }> = []
+
+  let unsupported = 0
+  let malformed = 0
+
+  for (const item of stateSync) {
+    if (item.type !== 'contact') {
+      unsupported += 1
+      continue
+    }
+
+    const action =
+      item.action?.toLowerCase()
+
+    if (
+      action !== 'add' &&
+      action !== 'remove'
+    ) {
+      unsupported += 1
+      continue
+    }
+
+    const phone = normalizePhone(
+      item.contact?.phone_number ?? ''
+    )
+
+    const timestamp =
+      item.metadata?.timestamp
+
+    const eventAt =
+      timestamp
+        ? strictCoexistenceEventTime(timestamp)
+        : null
+
+    if (!phone || !eventAt) {
+      malformed += 1
+      continue
+    }
+
+    sanitized.push({
+      phone,
+      action,
+      full_name:
+        action === 'add'
+          ? item.contact?.full_name?.trim() ||
+            null
+          : null,
+      first_name:
+        action === 'add'
+          ? item.contact?.first_name?.trim() ||
+            null
+          : null,
+      event_at: eventAt,
+    })
+  }
+
+  if (sanitized.length === 0) {
+    console.info(
+      '[coexistence-state-sync] no valid contact events:',
+      `received=${stateSync.length}`,
+      `unsupported=${unsupported}`,
+      `malformed=${malformed}`
+    )
+    return
+  }
+
+  /*
+   * The RPC is one DB transaction:
+   *
+   * - current Business App contact state;
+   * - stale/duplicate protection;
+   * - contact creation/name enrichment.
+   *
+   * No conversation is created here, and no automation/Flow/AI or
+   * outbound public webhook is dispatched for an initial address-book
+   * import.
+   */
+  const { data, error } =
+    await supabaseAdmin().rpc(
+      'apply_whatsapp_app_contact_sync',
+      {
+        p_account_id: config.account_id,
+        p_user_id: config.user_id,
+        p_phone_number_id: phoneNumberId,
+        p_events: sanitized,
+      }
+    )
+
+  if (error) {
+    console.error(
+      '[coexistence-state-sync] batch apply failed:',
+      error
+    )
+    return
+  }
+
+  console.info(
+    '[coexistence-state-sync] batch processed:',
+    JSON.stringify(data),
+    `unsupported=${unsupported}`,
+    `malformed=${malformed}`
+  )
 }
 
 interface CoexistenceHistoryMediaTarget {
