@@ -80,6 +80,33 @@ interface WhatsAppEditedMessage {
   document?: { caption?: string }
 }
 
+interface WhatsAppHistoryMessage extends WhatsAppMessage {
+  to?: string
+  history_context?: {
+    status?: string
+  }
+}
+
+interface WhatsAppHistoryChunk {
+  metadata?: {
+    phase?: number | string
+    chunk_order?: number
+    progress?: number | string
+  }
+  threads?: Array<{
+    id: string
+    messages?: WhatsAppHistoryMessage[]
+  }>
+  errors?: Array<{
+    code?: number
+    title?: string
+    message?: string
+    error_data?: {
+      details?: string
+    }
+  }>
+}
+
 interface WhatsAppMessageEcho extends WhatsAppMessage {
   to: string
   edit?: {
@@ -106,6 +133,7 @@ interface WhatsAppWebhookEntry {
       }>
       messages?: WhatsAppMessage[]
       message_echoes?: WhatsAppMessageEcho[]
+      history?: WhatsAppHistoryChunk[]
       statuses?: Array<{
         id: string
         status: string
@@ -265,6 +293,14 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       }
 
       const value = change.value
+
+      // WhatsApp Coexistence history is a backfill path, not a live
+      // inbound-message path. Keep it fully isolated from unread,
+      // automations, Flows, AI and public webhook fan-out.
+      if (change.field === 'history') {
+        await processCoexistenceHistory(value)
+        continue
+      }
 
       // Handle status updates
       if (value.statuses) {
@@ -898,6 +934,410 @@ async function handleCoexistenceRevoke(
     '[coexistence] WhatsApp Business App message revoked:',
     originalMessageId
   )
+}
+
+
+function strictCoexistenceEventTime(
+  timestamp: string
+): string | null {
+  if (!/^\d+$/.test(timestamp)) return null
+
+  const seconds = Number(timestamp)
+  if (!Number.isFinite(seconds)) return null
+
+  const date = new Date(seconds * 1000)
+  if (!Number.isFinite(date.getTime())) return null
+
+  return date.toISOString()
+}
+
+function mapCoexistenceHistoryStatus(
+  status: string | undefined,
+  isOutbound: boolean
+): 'sending' | 'sent' | 'delivered' | 'read' | 'failed' {
+  switch (status?.toUpperCase()) {
+    case 'PENDING':
+      return 'sending'
+    case 'SENT':
+      return 'sent'
+    case 'DELIVERED':
+      return 'delivered'
+    case 'READ':
+    case 'PLAYED':
+      return 'read'
+    case 'ERROR':
+      return 'failed'
+    default:
+      return isOutbound ? 'sent' : 'delivered'
+  }
+}
+
+async function processCoexistenceHistory(
+  value: WhatsAppWebhookValue
+) {
+  const phoneNumberId = value.metadata.phone_number_id
+
+  if (!phoneNumberId) {
+    console.warn(
+      '[coexistence-history] missing phone_number_id; ignored'
+    )
+    return
+  }
+
+  const { data: configRows, error: configError } =
+    await supabaseAdmin()
+      .from('whatsapp_config')
+      .select('*')
+      .eq('phone_number_id', phoneNumberId)
+
+  if (configError) {
+    console.error(
+      '[coexistence-history] error fetching whatsapp_config:',
+      configError
+    )
+    return
+  }
+
+  if (!configRows || configRows.length !== 1) {
+    console.error(
+      '[coexistence-history] expected exactly one config for phone_number_id:',
+      phoneNumberId,
+      'rows=',
+      configRows?.length ?? 0
+    )
+    return
+  }
+
+  const config = configRows[0]
+
+  // NULL means history import is deliberately disabled.
+  if (!config.coexistence_history_from) {
+    console.info(
+      '[coexistence-history] import disabled; payload ignored:',
+      phoneNumberId
+    )
+    return
+  }
+
+  const cutoffMs = Date.parse(
+    config.coexistence_history_from
+  )
+
+  if (!Number.isFinite(cutoffMs)) {
+    console.error(
+      '[coexistence-history] invalid configured cutoff; fail-closed:',
+      config.coexistence_history_from
+    )
+    return
+  }
+
+  const businessPhone = normalizePhone(
+    value.metadata.display_phone_number
+  )
+
+  if (!businessPhone) {
+    console.error(
+      '[coexistence-history] invalid business display phone; ignored'
+    )
+    return
+  }
+
+  /*
+   * Meta also uses field=history for a later media-detail payload,
+   * where value.messages contains the actual media ID. We deliberately
+   * leave that path untouched in this first text-only checkpoint.
+   */
+  if (value.messages?.length && !value.history?.length) {
+    console.info(
+      '[coexistence-history] media/detail payload deferred:',
+      value.messages.length
+    )
+    return
+  }
+
+  const chunks = value.history ?? []
+
+  if (chunks.length === 0) {
+    console.info(
+      '[coexistence-history] empty history payload ignored'
+    )
+    return
+  }
+
+  for (const chunk of chunks) {
+    if (chunk.errors?.length) {
+      for (const historyError of chunk.errors) {
+        console.warn(
+          '[coexistence-history] Meta history sync error:',
+          historyError.code ?? 'unknown',
+          historyError.title ??
+            historyError.message ??
+            historyError.error_data?.details ??
+            'unknown'
+        )
+      }
+      continue
+    }
+
+    const phase = chunk.metadata?.phase ?? 'unknown'
+    const chunkOrder =
+      chunk.metadata?.chunk_order ?? 'unknown'
+    const progress =
+      chunk.metadata?.progress ?? 'unknown'
+
+    let imported = 0
+    let duplicate = 0
+    let belowCutoff = 0
+    let unsupported = 0
+    let malformed = 0
+
+    for (const thread of chunk.threads ?? []) {
+      /*
+       * Filter BEFORE any contact/conversation lookup or creation.
+       *
+       * This is the critical privacy/scope boundary: a message outside
+       * coexistence_history_from must cause no CRM-side object creation.
+       */
+      const accepted = (
+        thread.messages ?? []
+      )
+        .map((message) => {
+          const createdAt =
+            strictCoexistenceEventTime(
+              message.timestamp
+            )
+
+          if (!createdAt) {
+            malformed += 1
+            return null
+          }
+
+          if (
+            Date.parse(createdAt) < cutoffMs
+          ) {
+            belowCutoff += 1
+            return null
+          }
+
+          // First checkpoint: text only.
+          // media_placeholder and media detail are handled next.
+          if (
+            message.type !== 'text' ||
+            typeof message.text?.body !==
+              'string'
+          ) {
+            unsupported += 1
+            return null
+          }
+
+          return {
+            message,
+            createdAt,
+          }
+        })
+        .filter(
+          (
+            item
+          ): item is {
+            message: WhatsAppHistoryMessage
+            createdAt: string
+          } => item !== null
+        )
+        .sort(
+          (a, b) =>
+            Date.parse(a.createdAt) -
+            Date.parse(b.createdAt)
+        )
+
+      // No accepted messages means absolutely no contact/conversation
+      // work for this thread.
+      if (accepted.length === 0) {
+        continue
+      }
+
+      const peerPhone = normalizePhone(
+        thread.id
+      )
+
+      if (!peerPhone) {
+        malformed += accepted.length
+        console.warn(
+          '[coexistence-history] invalid thread phone ignored:',
+          thread.id
+        )
+        continue
+      }
+
+      /*
+       * History does not contain profile.name reliably.
+       * Never replace an existing CRM contact name with its phone.
+       */
+      const existingContact =
+        await findExistingContact(
+          supabaseAdmin(),
+          config.account_id,
+          peerPhone
+        )
+
+      const contactOutcome:
+        ContactOutcome | null =
+        existingContact
+          ? {
+              contact: existingContact,
+              wasCreated: false,
+            }
+          : await findOrCreateContact(
+              config.account_id,
+              config.user_id,
+              peerPhone,
+              peerPhone
+            )
+
+      if (!contactOutcome) {
+        continue
+      }
+
+      const convResult =
+        await findOrCreateConversation(
+          config.account_id,
+          config.user_id,
+          contactOutcome.contact.id
+        )
+
+      if (!convResult) {
+        continue
+      }
+
+      const conversation =
+        convResult.conversation
+
+      /*
+       * Deliberately NO:
+       * - conversation.created webhook
+       * - unread increment
+       * - reopenClosedConversation
+       * - broadcast-reply mutation
+       * - Flows
+       * - automations
+       * - AI
+       * - message.received webhook
+       */
+      for (const item of accepted) {
+        const { message, createdAt } =
+          item
+
+        if (!message.id) {
+          malformed += 1
+          continue
+        }
+
+        const senderPhone =
+          normalizePhone(message.from)
+
+        if (!senderPhone) {
+          malformed += 1
+          continue
+        }
+
+        const isOutbound =
+          senderPhone === businessPhone
+
+        const contentText =
+          message.text?.body ?? null
+
+        const status =
+          mapCoexistenceHistoryStatus(
+            message.history_context?.status,
+            isOutbound
+          )
+
+        const {
+          data: insertedRows,
+          error: messageError,
+        } = await supabaseAdmin()
+          .from('messages')
+          .upsert(
+            {
+              conversation_id:
+                conversation.id,
+              sender_type: isOutbound
+                ? 'agent'
+                : 'customer',
+              sender_id: null,
+              content_type: 'text',
+              content_text: contentText,
+              media_url: null,
+              media_type: null,
+              template_name: null,
+              message_id: message.id,
+              status,
+              created_at: createdAt,
+            },
+            {
+              onConflict:
+                'conversation_id,message_id',
+              ignoreDuplicates: true,
+            }
+          )
+          .select('id')
+
+        if (messageError) {
+          console.error(
+            '[coexistence-history] message insert failed:',
+            message.id,
+            messageError
+          )
+          continue
+        }
+
+        if (
+          !insertedRows ||
+          insertedRows.length === 0
+        ) {
+          duplicate += 1
+        } else {
+          imported += 1
+        }
+
+        /*
+         * Safe even on retry: the DB updates the preview only if this
+         * historical timestamp is newer than the CURRENT last_message_at.
+         */
+        const { error: summaryError } =
+          await supabaseAdmin().rpc(
+            'advance_conversation_from_history',
+            {
+              p_conversation_id:
+                conversation.id,
+              p_last_message_text:
+                contentText || '[text]',
+              p_last_message_at:
+                createdAt,
+            }
+          )
+
+        if (summaryError) {
+          console.error(
+            '[coexistence-history] conversation summary update failed:',
+            conversation.id,
+            summaryError
+          )
+        }
+      }
+    }
+
+    console.info(
+      '[coexistence-history] chunk processed:',
+      `phase=${phase}`,
+      `chunk=${chunkOrder}`,
+      `progress=${progress}`,
+      `imported=${imported}`,
+      `duplicate=${duplicate}`,
+      `below_cutoff=${belowCutoff}`,
+      `unsupported=${unsupported}`,
+      `malformed=${malformed}`
+    )
+  }
 }
 
 async function processMessageEchoes(value: WhatsAppWebhookValue) {
