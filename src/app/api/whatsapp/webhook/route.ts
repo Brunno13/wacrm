@@ -596,7 +596,7 @@ type WhatsAppWebhookValue =
  * while the number is operating in Meta WhatsApp Coexistence mode.
  *
  * MVP:
- * - text echoes only;
+ * - text and common media echoes;
  * - stored as outbound/agent;
  * - no unread increment;
  * - no inbound automations, Flows or AI dispatch;
@@ -639,6 +639,16 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
   }
 
   const config = configRows[0]
+  const decryptedAccessToken = decrypt(config.access_token)
+
+  const supportedEchoTypes = new Set([
+    'text',
+    'image',
+    'video',
+    'document',
+    'audio',
+    'sticker',
+  ])
 
   for (const echo of echoes) {
     if (!echo.id || !echo.to) {
@@ -646,8 +656,7 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       continue
     }
 
-    // First implementation is intentionally restricted to plain text.
-    if (echo.type !== 'text') {
+    if (!supportedEchoTypes.has(echo.type)) {
       console.info(
         '[coexistence] unsupported app echo type ignored for now:',
         echo.type,
@@ -666,8 +675,8 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       continue
     }
 
-    // message_echoes do not reliably contain contacts/profile.name.
-    // Preserve an existing CRM contact name when possible.
+    // Echo payloads do not reliably contain contacts/profile.name.
+    // Preserve the CRM name when the contact already exists.
     const existingContact = await findExistingContact(
       supabaseAdmin(),
       config.account_id,
@@ -718,7 +727,19 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       ? new Date(timestampSeconds * 1000).toISOString()
       : new Date().toISOString()
 
-    const contentText = echo.text?.body ?? ''
+    const { contentText, mediaUrl, mediaType } =
+      await parseMessageContent(
+        echo,
+        decryptedAccessToken,
+        config.mirror_inbound_media !== false
+          ? { accountId: config.account_id }
+          : null
+      )
+
+    const contentType =
+      echo.type === 'sticker'
+        ? 'image'
+        : echo.type
 
     const { data: insertedRows, error: msgError } = await supabaseAdmin()
       .from('messages')
@@ -727,10 +748,10 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
           conversation_id: conversation.id,
           sender_type: 'agent',
           sender_id: null,
-          content_type: 'text',
-          content_text: contentText || null,
-          media_url: null,
-          media_type: null,
+          content_type: contentType,
+          content_text: contentText,
+          media_url: mediaUrl,
+          media_type: mediaType,
           template_name: null,
           message_id: echo.id,
           status: 'sent',
@@ -751,8 +772,6 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       continue
     }
 
-    // Meta may retry the same echo. Nothing below this point may run
-    // again for an already-persisted message.
     if (!insertedRows || insertedRows.length === 0) {
       console.info(
         '[coexistence] duplicate app echo ignored:',
@@ -761,14 +780,10 @@ async function processMessageEchoes(value: WhatsAppWebhookValue) {
       continue
     }
 
-    // Outbound human message:
-    // - refresh conversation summary;
-    // - do NOT increase unread_count;
-    // - pause AI auto-reply on this conversation.
     const { error: convError } = await supabaseAdmin()
       .from('conversations')
       .update({
-        last_message_text: contentText || '[text]',
+        last_message_text: contentText || `[${echo.type}]`,
         last_message_at: createdAt,
         updated_at: new Date().toISOString(),
         ai_autoreply_disabled: true,
