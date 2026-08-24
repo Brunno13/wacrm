@@ -37,6 +37,47 @@ const MASKED_TOKEN = '••••••••••••••••';
 type ConnectionStatus = 'connected' | 'disconnected' | 'unknown';
 type ResetReason = 'token_corrupted' | 'meta_api_error' | null;
 
+type EmbeddedSignupBootstrap = {
+  app_id: string;
+  config_id: string;
+  feature_type: 'whatsapp_business_app_onboarding';
+  session_info_version: '3';
+  graph_version: string;
+};
+
+type FacebookLoginResponse = {
+  authResponse?: {
+    code?: string;
+  };
+  status?: string;
+};
+
+type FacebookSdk = {
+  init: (options: {
+    appId: string;
+    autoLogAppEvents: boolean;
+    xfbml: boolean;
+    version: string;
+  }) => void;
+  login: (
+    callback: (response: FacebookLoginResponse) => void,
+    options: {
+      config_id: string;
+      response_type: 'code';
+      override_default_response_type: true;
+      extras: {
+        setup: Record<string, never>;
+        featureType: EmbeddedSignupBootstrap['feature_type'];
+        sessionInfoVersion: EmbeddedSignupBootstrap['session_info_version'];
+      };
+    },
+  ) => void;
+};
+
+type FacebookWindow = Window & typeof globalThis & {
+  FB?: FacebookSdk;
+};
+
 export function WhatsAppConfig() {
   const t = useTranslations('Settings.whatsapp');
   const supabase = createClient();
@@ -105,6 +146,17 @@ export function WhatsAppConfig() {
   };
   const [registrationProbe, setRegistrationProbe] =
     useState<RegistrationProbe | null>(null);
+
+  // Embedded Signup is prepared before the user clicks the button so
+  // FB.login can run synchronously inside the user gesture. The
+  // authorization code returned by Meta is intentionally not exchanged
+  // or persisted in this checkpoint.
+  const [embeddedSignupBootstrap, setEmbeddedSignupBootstrap] =
+    useState<EmbeddedSignupBootstrap | null>(null);
+  const [facebookSdkReady, setFacebookSdkReady] = useState(false);
+  const [embeddedSignupLoading, setEmbeddedSignupLoading] = useState(true);
+  const [embeddedSignupLaunching, setEmbeddedSignupLaunching] = useState(false);
+  const [embeddedSignupError, setEmbeddedSignupError] = useState<string | null>(null);
 
   const webhookUrl =
     typeof window !== 'undefined'
@@ -193,7 +245,7 @@ export function WhatsAppConfig() {
     // for the first render window and bail without ever retrying
     // once the profile arrives.
     if (authLoading || profileLoading) return;
-    if (!user || !accountId) {
+    if (!user?.id || !accountId) {
       loadedAccountIdRef.current = null;
       setLoading(false);
       return;
@@ -202,6 +254,236 @@ export function WhatsAppConfig() {
     loadedAccountIdRef.current = accountId;
     fetchConfig(accountId);
   }, [authLoading, profileLoading, user?.id, accountId, fetchConfig]);
+
+  useEffect(() => {
+    // The bootstrap endpoint is admin-only. Wait until auth/profile are
+    // settled so we do not generate a transient 401/403 while the page
+    // is still resolving the active account.
+    if (authLoading || profileLoading) return;
+
+    if (!user?.id || !accountId || !canEditSettings) {
+      setEmbeddedSignupBootstrap(null);
+      setFacebookSdkReady(false);
+      setEmbeddedSignupLoading(false);
+      setEmbeddedSignupError(
+        user?.id && accountId && !canEditSettings
+          ? 'Administrator access is required to use Embedded Signup.'
+          : null,
+      );
+      return;
+    }
+
+    let cancelled = false;
+
+    setEmbeddedSignupLoading(true);
+    setFacebookSdkReady(false);
+    setEmbeddedSignupError(null);
+
+    async function prepareEmbeddedSignup() {
+      try {
+        const response = await fetch(
+          '/api/whatsapp/embedded-signup/bootstrap',
+          {
+            method: 'GET',
+            cache: 'no-store',
+          },
+        );
+
+        const payload = (await response.json()) as
+          Partial<EmbeddedSignupBootstrap> & {
+            error?: string;
+          };
+
+        if (!response.ok) {
+          throw new Error(
+            payload.error ||
+              `Embedded Signup bootstrap failed with HTTP ${response.status}`,
+          );
+        }
+
+        // Fail closed if the server-side safety contract changes. In
+        // particular, never fall back to a generic Embedded Signup flow:
+        // this UI is being prepared specifically for Coexistence.
+        if (
+          !payload.app_id ||
+          !payload.config_id ||
+          payload.feature_type !== 'whatsapp_business_app_onboarding' ||
+          payload.session_info_version !== '3' ||
+          !payload.graph_version
+        ) {
+          throw new Error(
+            'Embedded Signup bootstrap returned an unexpected safety contract.',
+          );
+        }
+
+        const bootstrap: EmbeddedSignupBootstrap = {
+          app_id: payload.app_id,
+          config_id: payload.config_id,
+          feature_type: payload.feature_type,
+          session_info_version: payload.session_info_version,
+          graph_version: payload.graph_version,
+        };
+
+        if (cancelled) return;
+
+        setEmbeddedSignupBootstrap(bootstrap);
+
+        const facebookWindow = window as FacebookWindow;
+
+        const initializeFacebookSdk = () => {
+          if (cancelled) return;
+
+          if (!facebookWindow.FB) {
+            setFacebookSdkReady(false);
+            setEmbeddedSignupLoading(false);
+            setEmbeddedSignupError(
+              'Facebook JS SDK loaded, but window.FB is unavailable.',
+            );
+            return;
+          }
+
+          facebookWindow.FB.init({
+            appId: bootstrap.app_id,
+            autoLogAppEvents: true,
+            xfbml: false,
+            version: bootstrap.graph_version,
+          });
+
+          setFacebookSdkReady(true);
+          setEmbeddedSignupLoading(false);
+          setEmbeddedSignupError(null);
+        };
+
+        // Avoid loading the SDK more than once if React re-runs this
+        // effect or another part of the application already loaded it.
+        if (facebookWindow.FB) {
+          initializeFacebookSdk();
+          return;
+        }
+
+        let script = document.getElementById(
+          'facebook-jssdk',
+        ) as HTMLScriptElement | null;
+
+        const isNewScript = !script;
+
+        if (!script) {
+          script = document.createElement('script');
+          script.id = 'facebook-jssdk';
+          script.src = 'https://connect.facebook.net/en_US/sdk.js';
+          script.async = true;
+          script.defer = true;
+          script.crossOrigin = 'anonymous';
+        }
+
+        script.addEventListener(
+          'load',
+          initializeFacebookSdk,
+          { once: true },
+        );
+
+        script.addEventListener(
+          'error',
+          () => {
+            if (cancelled) return;
+
+            setFacebookSdkReady(false);
+            setEmbeddedSignupLoading(false);
+            setEmbeddedSignupError(
+              'Could not load the Facebook JS SDK.',
+            );
+          },
+          { once: true },
+        );
+
+        if (isNewScript) {
+          document.body.appendChild(script);
+        }
+      } catch (error) {
+        if (cancelled) return;
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Could not prepare Embedded Signup.';
+
+        console.error('Embedded Signup preparation failed:', error);
+        setEmbeddedSignupBootstrap(null);
+        setFacebookSdkReady(false);
+        setEmbeddedSignupLoading(false);
+        setEmbeddedSignupError(message);
+      }
+    }
+
+    void prepareEmbeddedSignup();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authLoading,
+    profileLoading,
+    user?.id,
+    accountId,
+    canEditSettings,
+  ]);
+
+  function handleLaunchEmbeddedSignup() {
+    if (embeddedSignupLaunching) return;
+
+    const facebookWindow = window as FacebookWindow;
+
+    if (
+      !embeddedSignupBootstrap ||
+      !facebookSdkReady ||
+      !facebookWindow.FB
+    ) {
+      toast.error('Embedded Signup is not ready yet.');
+      return;
+    }
+
+    setEmbeddedSignupLaunching(true);
+
+    try {
+      // IMPORTANT: FB.login is called synchronously from this click
+      // handler. Do not add an await before this call or browsers may
+      // treat the popup as unrelated to the user gesture.
+      facebookWindow.FB.login(
+        (response) => {
+          setEmbeddedSignupLaunching(false);
+
+          if (response.authResponse?.code) {
+            // Deliberately do not log, persist or exchange the code yet.
+            // The next backend phase will consume it server-side.
+            toast.success(
+              'Embedded Signup returned an authorization code. Server-side exchange is intentionally disabled in this checkpoint.',
+              { duration: 10000 },
+            );
+            return;
+          }
+
+          toast.error(
+            'Embedded Signup was cancelled or completed without an authorization code.',
+          );
+        },
+        {
+          config_id: embeddedSignupBootstrap.config_id,
+          response_type: 'code',
+          override_default_response_type: true,
+          extras: {
+            setup: {},
+            featureType: embeddedSignupBootstrap.feature_type,
+            sessionInfoVersion:
+              embeddedSignupBootstrap.session_info_version,
+          },
+        },
+      );
+    } catch (error) {
+      console.error('Embedded Signup launch failed:', error);
+      setEmbeddedSignupLaunching(false);
+      toast.error('Could not launch Embedded Signup.');
+    }
+  }
 
   async function handleToggleMirrorMedia(next: boolean) {
     if (!config || !accountId || savingMirror) return;
@@ -597,6 +879,82 @@ export function WhatsAppConfig() {
             )}
           </Alert>
         )}
+
+        {/* Embedded Signup — Coexistence */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-foreground">
+              WhatsApp Business App — Coexistence
+            </CardTitle>
+            <CardDescription className="text-muted-foreground">
+              Launch Meta Embedded Signup for the Coexistence onboarding
+              flow. This checkpoint only validates the browser flow; the
+              authorization code is not exchanged or persisted yet.
+            </CardDescription>
+          </CardHeader>
+
+          <CardContent className="space-y-4">
+            <div className="flex items-start gap-3 rounded-md border border-border p-3">
+              {embeddedSignupLoading ? (
+                <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground" />
+              ) : facebookSdkReady && embeddedSignupBootstrap ? (
+                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-400" />
+              ) : (
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-400" />
+              )}
+
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-foreground">
+                  Embedded Signup readiness
+                </p>
+
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {embeddedSignupLoading
+                    ? 'Preparing authenticated bootstrap and Facebook JS SDK...'
+                    : embeddedSignupError
+                      ? embeddedSignupError
+                      : facebookSdkReady && embeddedSignupBootstrap
+                        ? `Ready — ${embeddedSignupBootstrap.graph_version}, Session Info ${embeddedSignupBootstrap.session_info_version}`
+                        : 'Embedded Signup is not ready.'}
+                </p>
+              </div>
+            </div>
+
+            <Button
+              type="button"
+              onClick={handleLaunchEmbeddedSignup}
+              disabled={
+                !canEditSettings ||
+                embeddedSignupLoading ||
+                !facebookSdkReady ||
+                !embeddedSignupBootstrap ||
+                embeddedSignupLaunching
+              }
+            >
+              {embeddedSignupLaunching ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Opening Meta...
+                </>
+              ) : (
+                <>
+                  <ExternalLink className="size-4" />
+                  Open Meta Embedded Signup
+                </>
+              )}
+            </Button>
+
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              Safety checkpoint: this launcher accepts only
+              <code className="mx-1">
+                whatsapp_business_app_onboarding
+              </code>
+              with Session Info v3. It does not call
+              <code className="mx-1">/register</code>
+              and does not persist credentials returned by Meta.
+            </p>
+          </CardContent>
+        </Card>
 
         {/* API Credentials */}
         <Card>
